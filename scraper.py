@@ -86,6 +86,14 @@ def get_datatable_id(driver: webdriver.Chrome) -> str | None:
 
 
 # ── Primary extraction: JS DataTables API ──────────────────────────────────────
+#
+# Cell extraction rules (discovered by inspecting the UNMSM page HTML):
+#   • Puntaje  → <td data-score="461.375"></td>        ← value in data-score, text empty
+#   • Mérito   → <td data-merit="41"></td>             ← value in data-merit, text empty
+#   • Nombres/Escuela → <span class="obfuscated" data-auth="BASE64">text</span>
+#                       ← base64 decoded for correct UTF-8 (Ñ, Á, É, …)
+#   • Other cells → plain innerText
+#
 _JS_EXTRACT_ALL = """
 try {
     var dt = $('#%s').DataTable();
@@ -95,7 +103,29 @@ try {
         if (!node) return;
         var cells = node.querySelectorAll('td');
         var row = [];
-        cells.forEach(function(c) { row.push(c.innerText.trim()); });
+        cells.forEach(function(c) {
+            var text;
+            if (c.hasAttribute('data-score')) {
+                // Puntaje: numeric value stored as attribute, cell body is empty
+                text = c.getAttribute('data-score') || '';
+            } else if (c.hasAttribute('data-merit')) {
+                // Mérito E.P: same pattern
+                text = c.getAttribute('data-merit') || '';
+            } else {
+                var span = c.querySelector('span.obfuscated[data-auth]');
+                if (span) {
+                    // Names / Escuela are base64-encoded UTF-8 to prevent simple scraping
+                    try {
+                        text = decodeURIComponent(escape(atob(span.getAttribute('data-auth'))));
+                    } catch(e) {
+                        text = span.innerText.trim();
+                    }
+                } else {
+                    text = c.innerText.trim();
+                }
+            }
+            row.push(text);
+        });
         result.push(row);
     });
     return result;
@@ -125,21 +155,46 @@ try {
 """
 
 
+_JS_FALLBACK_ROWS = """
+(function() {
+    var rows = document.querySelectorAll('#%s tbody tr');
+    var result = [];
+    rows.forEach(function(tr) {
+        var cells = tr.querySelectorAll('td');
+        var row = [];
+        cells.forEach(function(c) {
+            var text;
+            if (c.hasAttribute('data-score')) {
+                text = c.getAttribute('data-score') || '';
+            } else if (c.hasAttribute('data-merit')) {
+                text = c.getAttribute('data-merit') || '';
+            } else {
+                var span = c.querySelector('span.obfuscated[data-auth]');
+                if (span) {
+                    try { text = decodeURIComponent(escape(atob(span.getAttribute('data-auth')))); }
+                    catch(e) { text = span.innerText.trim(); }
+                } else {
+                    text = c.innerText.trim();
+                }
+            }
+            row.push(text);
+        });
+        result.push(row);
+    });
+    return result;
+})();
+"""
+
+
 def extract_via_show_all(driver: webdriver.Chrome, table_id: str) -> list[list[str]]:
     """
     Fallback: set DataTable page-length to -1 (All) and scrape visible DOM rows.
+    Uses the same attribute-aware extraction as the primary JS path.
     """
     total = driver.execute_script(_JS_SHOW_ALL % table_id)
     log.info(f"    Fallback: showing all {total} rows, waiting for redraw...")
     time.sleep(DRAW_WAIT)
-
-    rows = driver.find_elements(By.CSS_SELECTOR, f"#{table_id} tbody tr")
-    result = []
-    for row in rows:
-        cols = row.find_elements(By.TAG_NAME, "td")
-        if cols:
-            result.append([c.text.strip() for c in cols])
-    return result
+    return driver.execute_script(_JS_FALLBACK_ROWS % table_id) or []
 
 
 # ── Career list ────────────────────────────────────────────────────────────────
@@ -178,16 +233,47 @@ COLUMNS = ["Carrera", "Código", "Apellidos y Nombres", "Escuela",
            "Puntaje", "Mérito E.P", "Observación"]
 
 
-def scrape_career(driver: webdriver.Chrome, name: str, url: str) -> list[dict]:
-    """Navigate to a career page and return all applicant records."""
-    try:
-        driver.get(url)
-    except Exception as exc:
-        log.warning(f"  Could not navigate to {url}: {exc}")
-        return []
+_NETWORK_ERRORS = ("ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED",
+                   "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_TIMED_OUT",
+                   "net::ERR_")
+MAX_RETRIES = 4
+RETRY_BACKOFF = [5, 15, 30, 60]   # seconds between retries
 
-    if not wait_for_table(driver):
-        log.warning(f"  No table rows found on page for '{name}', skipping.")
+
+def scrape_career(driver: webdriver.Chrome, name: str, url: str) -> list[dict]:
+    """
+    Navigate to a career page and return all applicant records.
+    Retries on transient network errors with exponential back-off.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            driver.get(url)
+        except Exception as exc:
+            msg = str(exc)
+            is_network = any(e in msg for e in _NETWORK_ERRORS)
+            if is_network and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF[attempt - 1]
+                log.warning(f"  Network error on attempt {attempt}/{MAX_RETRIES}, "
+                            f"retrying in {wait}s... ({msg.splitlines()[0]})")
+                time.sleep(wait)
+                continue
+            log.warning(f"  Could not navigate to {url}: {msg.splitlines()[0]}")
+            return []
+
+        if not wait_for_table(driver):
+            # Could be a transient load failure — retry if network-related
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF[attempt - 1]
+                log.warning(f"  No table rows on attempt {attempt}/{MAX_RETRIES}, "
+                            f"retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            log.warning(f"  No table rows found for '{name}', skipping.")
+            return []
+
+        # Page loaded — proceed
+        break
+    else:
         return []
 
     # Small pause for DataTables to fully initialise
@@ -210,13 +296,13 @@ def scrape_career(driver: webdriver.Chrome, name: str, url: str) -> list[dict]:
     for row in raw_rows:
         if len(row) >= 6:
             records.append({
-                "Carrera":            name,
-                "Código":             row[0],
+                "Carrera":             name,
+                "Código":              row[0],
                 "Apellidos y Nombres": row[1],
-                "Escuela":            row[2],
-                "Puntaje":            row[3],
-                "Mérito E.P":         row[4],
-                "Observación":        row[5],
+                "Escuela":             row[2],
+                "Puntaje":             row[3],
+                "Mérito E.P":          row[4],
+                "Observación":         row[5],
             })
 
     return records
