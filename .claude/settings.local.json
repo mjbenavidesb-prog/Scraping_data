@@ -4,7 +4,8 @@
       "Bash(pip install:*)",
       "Bash(python -c \"import selenium; print\\('selenium', selenium.__version__\\)\")",
       "Bash(python scraper.py)",
-      "Bash(python -)"
+      "Bash(python -)",
+      "Bash(python -c ':*)"
     ]
   }
 }
